@@ -1,0 +1,13 @@
+# Compiled programs - must NOT be submitted (spec guideline 8)
+/tracker
+/peer
+peer*/peer
+*.o
+
+# Tracker files created while running. The tracker must start with
+# no .track files (final demo guideline), so never commit them.
+torrents/*.track
+
+# Editor / OS clutter
+.vscode/
+.DS_Store
