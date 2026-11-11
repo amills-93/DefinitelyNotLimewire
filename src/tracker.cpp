@@ -48,29 +48,24 @@ const char unknownCommandReply[] = "ERROR: unknown command\n";
 std::mutex trackerFilesMutex;
 
 // sconfig: line 1 = port number, line 2 = shared folder (torrents).
-// Returns false if the file is missing, too short, or has a bad port.
+// Returns false (with a clear error printed) if the file is missing,
+// too short, or has a bad port.
 bool readConfig(int& port, std::string& folder) {
-    std::vector<std::string> config = readConfigLines("sconfig");
-    if (config.size() < 2) {
-        std::cerr << "Tracker: could not read sconfig (need port and folder)\n";
+    const char usage[] =
+        "  line 1: tracker listen port (1-65535), e.g. 9000\n"
+        "  line 2: shared folder for tracker files, e.g. torrents\n";
+
+    std::vector<std::string> config;
+    if (!loadConfigFile("Tracker", "sconfig", 2, usage, config)) {
         return false;
     }
 
-    // The port must be a plain number between 1 and 65535
-    errno = 0;
-    char* end = nullptr;
-    long portValue = std::strtol(config[0].c_str(), &end, 10);
-    if (config[0].empty() || errno != 0 || *end != '\0' ||
-        portValue < 1 || portValue > 65535) {
-        std::cerr << "Tracker: bad port '" << config[0] << "' in sconfig\n";
+    if (!parsePort(config[0], port)) {
+        std::cerr << "Tracker: sconfig line 1: invalid port '" << config[0]
+                  << "' (must be a number from 1 to 65535)\n";
         return false;
     }
-    port = static_cast<int>(portValue);
 
-    if (config[1].empty()) {
-        std::cerr << "Tracker: empty shared folder in sconfig\n";
-        return false;
-    }
     folder = config[1];
     return true;
 }
@@ -78,17 +73,19 @@ bool readConfig(int& port, std::string& folder) {
 // Makes sure the shared folder exists and starts with no tracker files.
 // Leftover .track files from an earlier run are deleted on purpose, so
 // every server start is a clean start (the demo needs an empty folder).
-void prepareSharedFolder(const std::string& folder) {
+// Returns false (error printed) if the folder can't be created or opened.
+bool prepareSharedFolder(const std::string& folder) {
     if (mkdir(folder.c_str(), 0755) != 0 && errno != EEXIST) {
-        std::cerr << "Tracker: could not create folder '" << folder
-                  << "': " << std::strerror(errno) << "\n";
-        return;  // not fatal: the handlers will just find nothing there
+        std::cerr << "Tracker: could not create shared folder '" << folder
+                  << "' (sconfig line 2): " << std::strerror(errno) << "\n";
+        return false;
     }
 
     DIR* dir = opendir(folder.c_str());
     if (dir == nullptr) {
-        std::cerr << "Tracker: could not open folder '" << folder << "'\n";
-        return;
+        std::cerr << "Tracker: could not open shared folder '" << folder
+                  << "' (sconfig line 2): " << std::strerror(errno) << "\n";
+        return false;
     }
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr) {
@@ -105,6 +102,7 @@ void prepareSharedFolder(const std::string& folder) {
         }
     }
     closedir(dir);
+    return true;
 }
 
 // Creates the listening socket on port. Returns -1 on failure, with the
@@ -297,7 +295,9 @@ int main() {
         return 1;
     }
 
-    prepareSharedFolder(folder);
+    if (!prepareSharedFolder(folder)) {
+        return 1;
+    }
 
     // A worker whose peer disappears mid-reply would otherwise take a
     // SIGPIPE and kill the whole server with it
