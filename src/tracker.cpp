@@ -21,7 +21,9 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -30,6 +32,7 @@
 
 #include "common.h"
 #include "tracker_file.h"
+#include "md5.h"
 
 namespace {
 
@@ -57,6 +60,10 @@ long long updateIntervalSeconds = defaultUpdateIntervalSeconds;
 // (once implemented) hold this around their load -> modify -> save
 // sequence, because TrackerFile itself is not thread-safe.
 std::mutex trackerFilesMutex;
+
+// The shared folder from sconfig (e.g. "torrents"). Set once in main()
+// before any worker thread starts, then only read by the handlers.
+std::string sharedFolder;
 
 // sconfig: line 1 = port number, line 2 = shared folder (torrents).
 // Returns false if the file is missing, too short, or has a bad port.
@@ -227,10 +234,61 @@ std::string handleList(const std::vector<std::string>& /*args*/) {
     return "LIST handler not implemented yet\n";
 }
 
-/// GET <filename>: will reply with the tracker file contents between
-/// <REP GET BEGIN> and <REP GET END FileMD5>.
-std::string handleGet(const std::vector<std::string>& /*args*/) {
-    return "GET handler not implemented yet\n";
+/// GET <filename>.track: replies with the tracker file's contents:
+///   <REP GET BEGIN>\n
+///   <tracker file content, which already ends in \n>
+///   <REP GET END FileMD5>\n
+/// FileMD5 is the MD5 of exactly the content sent, so the peer can
+/// check that what it received is intact.
+/// The doc defines no GET error reply, so these two are our choice:
+///   <GET invalid>\n     the request is malformed
+///   <REP GET ferr>\n    no such tracker file
+std::string handleGet(const std::vector<std::string>& args) {
+    // Expect exactly one word: the tracker file name
+    if (args.size() != 1) {
+        return "<GET invalid>\n";
+    }
+    std::string name = args[0];
+
+    // Refuse names that could reach outside the shared folder
+    // (e.g. "../sconfig"), so a peer can only read tracker files
+    if (name.find('/') != std::string::npos || name.find("..") != std::string::npos) {
+        return "<GET invalid>\n";
+    }
+
+    // Accept "movie1.avi.track" and also plain "movie1.avi"
+    const std::string extension = ".track";
+    if (name.size() < extension.size() ||
+        name.compare(name.size() - extension.size(), extension.size(), extension) != 0) {
+        name += extension;
+    }
+    std::string path = sharedFolder + "/" + name;
+
+    // Read the whole file while holding the mutex, so we never read a
+    // tracker in the middle of a createtracker/updatetracker change
+    std::string content;
+    {
+        std::lock_guard<std::mutex> lock(trackerFilesMutex);
+        std::ifstream file(path, std::ios::binary);
+        if (!file) {
+            std::cout << "Tracker: GET " << name << " -> not found\n";
+            return "<REP GET ferr>\n";
+        }
+        content.assign(std::istreambuf_iterator<char>(file),
+                       std::istreambuf_iterator<char>());
+        if (file.bad()) {
+            return "<REP GET ferr>\n";
+        }
+    }
+
+    // Make sure the END line starts on its own line
+    if (!content.empty() && content.back() != '\n') {
+        content += '\n';
+    }
+
+    std::cout << "Tracker: GET " << name << " -> sent\n";
+    return "<REP GET BEGIN>\n" + content +
+           "<REP GET END " + md5OfString(content) + ">\n";
 }
 
 /// createtracker: will build a fresh tracker with TrackerFile::createSeed()
@@ -418,6 +476,7 @@ int main() {
 
     sharedFolder = folder;
     prepareSharedFolder(folder);
+    sharedFolder = folder;  // the handlers read tracker files from here
 
     // A worker whose peer disappears mid-reply would otherwise take a
     // SIGPIPE and kill the whole server with it
