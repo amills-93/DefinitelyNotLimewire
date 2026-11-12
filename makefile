@@ -8,9 +8,9 @@ CXX      = g++
 CXXFLAGS = -std=c++17 -Wall -Wextra -pthread
 
 # Source files for each program
-TRACKER_SRC = src/tracker.cpp src/common.cpp
-PEER_SRC    = src/peer.cpp src/common.cpp
-HEADERS     = src/common.h
+TRACKER_SRC = src/tracker.cpp src/common.cpp src/tracker_file.cpp
+PEER_SRC    = src/peer.cpp src/common.cpp src/tracker_file.cpp
+HEADERS     = src/common.h src/tracker_file.h
 
 # The three simulated peer folders (spec: "How To Run the Peer Program")
 PEERS = peer1 peer2 peer3
