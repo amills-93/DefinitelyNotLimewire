@@ -4,10 +4,9 @@
 // Reads its port and shared folder from sconfig (line 1 = port,
 // line 2 = folder), then serves TCP connections with one worker
 // thread per connection: REQ LIST, GET, createtracker, updatetracker.
-// The handlers are stubs for now; this file provides the socket setup,
-// the worker threads, the command dispatch and the mutex the handlers
-// will use.
-
+// This file provides the socket setup, the worker threads, the command
+// dispatch and the handlers for each command.
+ 
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <netinet/in.h>
@@ -15,7 +14,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
-
+ 
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
@@ -30,38 +29,38 @@
 #include <string>
 #include <thread>
 #include <vector>
-
+ 
 #include "common.h"
 #include "tracker_file.h"
 #include "md5.h"
-
+ 
 namespace {
-
+ 
 // How many connections the kernel may queue before accept() takes them
 const int listenBacklog = 16;
-
+ 
 // Longest request line we accept; a bigger one is answered with an
 // error instead of growing our memory forever
 const std::size_t maxRequestBytes = 4096;
-
+ 
 // The reply for commands the tracker does not know. The doc does not
 // define one, so this is our choice.
 const char unknownCommandReply[] = "ERROR: unknown command\n";
-
+ 
 // Default peer update interval in seconds (15 minutes, matching peer config)
 const long long defaultUpdateIntervalSeconds = 900;
-
+ 
 // Shared folder where .track files are stored (loaded from sconfig at startup)
 std::string sharedFolder;
-
+ 
 // Maximum age (in seconds) before a peer entry is considered dead
 long long updateIntervalSeconds = defaultUpdateIntervalSeconds;
-
+ 
 // One mutex around every tracker-file read/modify/write. The handlers
-// (once implemented) hold this around their load -> modify -> save
+// hold this around their load -> modify -> save
 // sequence, because TrackerFile itself is not thread-safe.
 std::mutex trackerFilesMutex;
-
+ 
 // sconfig: line 1 = port number, line 2 = shared folder (torrents).
 // Returns false (with a clear error printed) if the file is missing,
 // too short, or has a bad port.
@@ -69,20 +68,20 @@ bool readConfig(int& port, std::string& folder) {
     const char usage[] =
         "  line 1: tracker listen port (1-65535), e.g. 9000\n"
         "  line 2: shared folder for tracker files, e.g. torrents\n";
-
+ 
     std::vector<std::string> config;
     if (!loadConfigFile("Tracker", "sconfig", 2, usage, config)) {
         return false;
     }
-
+ 
     if (!parsePort(config[0], port)) {
         std::cerr << "Tracker: sconfig line 1: invalid port '" << config[0]
                   << "' (must be a number from 1 to 65535)\n";
         return false;
     }
-
+ 
     folder = config[1];
-
+ 
     // Optional 3rd line in sconfig for update interval; otherwise fall back
     // to peer1/clientThreadConfig.cfg (line 3) or defaultUpdateIntervalSeconds
     if (config.size() >= 3) {
@@ -107,7 +106,7 @@ bool readConfig(int& port, std::string& folder) {
     }
     return true;
 }
-
+ 
 // Makes sure the shared folder exists and starts with no tracker files.
 // Leftover .track files from an earlier run are deleted on purpose, so
 // every server start is a clean start (the demo needs an empty folder).
@@ -118,7 +117,7 @@ bool prepareSharedFolder(const std::string& folder) {
                   << "' (sconfig line 2): " << std::strerror(errno) << "\n";
         return false;
     }
-
+ 
     DIR* dir = opendir(folder.c_str());
     if (dir == nullptr) {
         std::cerr << "Tracker: could not open shared folder '" << folder
@@ -142,7 +141,7 @@ bool prepareSharedFolder(const std::string& folder) {
     closedir(dir);
     return true;
 }
-
+ 
 // Creates the listening socket on port. Returns -1 on failure, with the
 // error already printed.
 int createListenSocket(int port) {
@@ -151,7 +150,7 @@ int createListenSocket(int port) {
         std::cerr << "Tracker: socket failed: " << std::strerror(errno) << "\n";
         return -1;
     }
-
+ 
     // Without this, restarting the server right after stopping it fails
     // with "Address already in use" (the old port sits in TIME_WAIT)
     int reuse = 1;
@@ -160,7 +159,7 @@ int createListenSocket(int port) {
         close(listenSocket);
         return -1;
     }
-
+ 
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_ANY);  // listen on every interface
@@ -177,7 +176,7 @@ int createListenSocket(int port) {
     }
     return listenSocket;
 }
-
+ 
 // Reads one request line from the socket, looping until '\n' arrives
 // (a single recv() can return only part of the line). A peer that
 // closes without a newline still counts: its partial line is used.
@@ -203,7 +202,7 @@ bool recvLine(int clientSocket, std::string& line) {
     }
     return !line.empty();
 }
-
+ 
 // Sends the whole reply, looping because one send() may write only
 // part of it. Returns false if the connection breaks.
 bool sendAll(int clientSocket, const std::string& text) {
@@ -220,87 +219,52 @@ bool sendAll(int clientSocket, const std::string& text) {
     }
     return true;
 }
-
+ 
 // ---- request handlers ----
-
-// One LIST row: the header fields shown for a tracker file. The .track
-// path is kept only to order files that share the same Filename.
-struct ListEntry {
-    std::string name;
-    long long size = 0;
-    std::string md5;
-    std::string path;
-};
-
-/// REQ LIST: scans the shared folder and replies with one line per
-/// tracker file, e.g.
-///   <REP LIST 2>
-///   <1 movie1.avi 104857600 d41d8cd98f00b204e9800998ecf8427e>
-///   <2 movie2.mkv 209715200 0cc175b9c0f1b6a831c399e269772661>
-///   <REP LIST END>
-/// The original Filename header is printed (not the .track name), which
-/// is what the doc's example shows and what GET accepts (it adds .track
-/// itself). The doc leaves the order open, so entries are sorted by name.
-std::string handleList(const std::vector<std::string>& /*args*/, const std::string& peer) {
-    std::cout << "Tracker: LIST requested from " << peer << "\n";
-
-    std::vector<ListEntry> entries;
-    {
-        // Hold the tracker-file mutex for the whole scan, so a writer can
-        // never change a file between our open and read.
-        std::lock_guard<std::mutex> lock(trackerFilesMutex);
-
-        DIR* dir = opendir(sharedFolder.c_str());
-        if (dir == nullptr) {
-            // The doc defines no reply for this, so this is our choice
-            std::cerr << "Tracker: could not read shared folder '" << sharedFolder
-                      << "': " << std::strerror(errno) << "\n";
-            return "ERROR: could not read shared folder\n";
-        }
-
-        struct dirent* item;
-        while ((item = readdir(dir)) != nullptr) {
-            std::string fileName = item->d_name;
-            // only files ending in .track (and not the bare name ".track")
-            if (fileName.size() <= 6 ||
-                fileName.compare(fileName.size() - 6, 6, ".track") != 0) {
-                continue;
-            }
-
-            std::string path = sharedFolder + "/" + fileName;
-            // load() skips # comments and checks the header fields, so a
-            // malformed file is simply left out of the reply
-            TrackerFile tracker;
-            if (!tracker.load(path)) {
-                std::cerr << "Tracker: malformed tracker file '" << path
-                          << "' (skipped)\n";
-                continue;
-            }
-            entries.push_back(ListEntry{tracker.filename, tracker.filesize,
-                                        tracker.md5, path});
-        }
-        closedir(dir);
+ 
+/// REQ LIST: loads every .track file in the shared folder and replies
+///   <REP LIST X>\n
+///   <1 file1name file1size file1MD5>\n
+///   ...
+///   <REP LIST END>\n
+/// Tracker files that can't be parsed are skipped (and not counted in X).
+std::string handleList(const std::vector<std::string>& /*args*/) {
+    std::vector<std::string> trackerNames;
+ 
+    // Hold the mutex while reading so we never see a half-written tracker
+    std::lock_guard<std::mutex> lock(trackerFilesMutex);
+ 
+    DIR* dir = opendir(sharedFolder.c_str());
+    if (dir == nullptr) {
+        std::cerr << "Tracker: LIST could not open '" << sharedFolder << "': "
+                  << std::strerror(errno) << "\n";
+        return "<REP LIST 0>\n<REP LIST END>\n";
     }
-
-    std::sort(entries.begin(), entries.end(),
-              [](const ListEntry& a, const ListEntry& b) {
-                  if (a.name != b.name) {
-                      return a.name < b.name;
-                  }
-                  return a.path < b.path;
-              });
-
-    // An empty folder gives "<REP LIST 0>" directly followed by the END line
-    std::ostringstream reply;
-    reply << "<REP LIST " << entries.size() << ">\n";
-    for (std::size_t i = 0; i < entries.size(); i++) {
-        reply << "<" << (i + 1) << " " << entries[i].name << " "
-              << entries[i].size << " " << entries[i].md5 << ">\n";
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        std::string name = entry->d_name;
+        if (name.size() > 6 && name.compare(name.size() - 6, 6, ".track") == 0) {
+            trackerNames.push_back(name);
+        }
     }
-    reply << "<REP LIST END>\n";
-    return reply.str();
+    closedir(dir);
+    std::sort(trackerNames.begin(), trackerNames.end());  // stable, readable order
+ 
+    std::string body;
+    int count = 0;
+    for (const std::string& name : trackerNames) {
+        TrackerFile tracker;
+        if (!tracker.load(sharedFolder + "/" + name)) {
+            std::cerr << "Tracker: LIST skipping unreadable '" << name << "'\n";
+            continue;
+        }
+        count++;
+        body += "<" + std::to_string(count) + " " + tracker.filename + " " +
+                std::to_string(tracker.filesize) + " " + tracker.md5 + ">\n";
+    }
+    return "<REP LIST " + std::to_string(count) + ">\n" + body + "<REP LIST END>\n";
 }
-
+ 
 /// GET <filename>.track: replies with the tracker file's contents:
 ///   <REP GET BEGIN>\n
 ///   <tracker file content, which already ends in \n>
@@ -316,13 +280,13 @@ std::string handleGet(const std::vector<std::string>& args) {
         return "<GET invalid>\n";
     }
     std::string name = args[0];
-
+ 
     // Refuse names that could reach outside the shared folder
     // (e.g. "../sconfig"), so a peer can only read tracker files
     if (name.find('/') != std::string::npos || name.find("..") != std::string::npos) {
         return "<GET invalid>\n";
     }
-
+ 
     // Accept "movie1.avi.track" and also plain "movie1.avi"
     const std::string extension = ".track";
     if (name.size() < extension.size() ||
@@ -330,7 +294,7 @@ std::string handleGet(const std::vector<std::string>& args) {
         name += extension;
     }
     std::string path = sharedFolder + "/" + name;
-
+ 
     // Read the whole file while holding the mutex, so we never read a
     // tracker in the middle of a createtracker/updatetracker change
     std::string content;
@@ -347,17 +311,17 @@ std::string handleGet(const std::vector<std::string>& args) {
             return "<REP GET ferr>\n";
         }
     }
-
+ 
     // Make sure the END line starts on its own line
     if (!content.empty() && content.back() != '\n') {
         content += '\n';
     }
-
+ 
     std::cout << "Tracker: GET " << name << " -> sent\n";
     return "<REP GET BEGIN>\n" + content +
            "<REP GET END " + md5OfString(content) + ">\n";
 }
-
+ 
 /// createtracker: builds a fresh tracker with TrackerFile::createSeed()
 /// and saves it as <filename>.track in the shared folder.
 /// Wire format: <createtracker filename filesize description md5 ip-address port-number>\n
@@ -366,21 +330,21 @@ std::string handleCreateTracker(const std::vector<std::string>& args) {
     if (args.size() != 6) {
         return "<createtracker fail>\n";
     }
-
+ 
     const std::string& filename = args[0];
     const std::string& filesizeStr = args[1];
     std::string description = args[2];
     const std::string& md5 = args[3];
     const std::string& seedIp = args[4];
     const std::string& portStr = args[5];
-
+ 
     // Reject empty or path-traversing filenames
     if (filename.empty() || filename == "." || filename == ".." ||
         filename.find('/') != std::string::npos ||
         filename.find('\\') != std::string::npos) {
         return "<createtracker fail>\n";
     }
-
+ 
     // Parse filesize (non-negative decimal integer)
     errno = 0;
     char* end = nullptr;
@@ -388,7 +352,7 @@ std::string handleCreateTracker(const std::vector<std::string>& args) {
     if (filesizeStr.empty() || errno != 0 || *end != '\0' || filesize < 0) {
         return "<createtracker fail>\n";
     }
-
+ 
     // Parse port (1..65535)
     errno = 0;
     end = nullptr;
@@ -398,38 +362,38 @@ std::string handleCreateTracker(const std::vector<std::string>& args) {
         return "<createtracker fail>\n";
     }
     int seedPort = static_cast<int>(portValue);
-
+ 
     if (md5.empty() || seedIp.empty() || sharedFolder.empty()) {
         return "<createtracker fail>\n";
     }
-
+ 
     // Validate IPv4 address format (also rejects colons that would break peer lines)
     in_addr parsedIp{};
     if (inet_pton(AF_INET, seedIp.c_str(), &parsedIp) != 1) {
         return "<createtracker fail>\n";
     }
-
+ 
     // Description uses '_' for spaces in the wire format
     std::replace(description.begin(), description.end(), '_', ' ');
-
+ 
     std::string trackPath = sharedFolder + "/" + filename + ".track";
-
+ 
     std::lock_guard<std::mutex> lock(trackerFilesMutex);
-
+ 
     struct stat st{};
     if (stat(trackPath.c_str(), &st) == 0) {
         return "<createtracker ferr>\n";
     }
-
+ 
     TrackerFile tracker = TrackerFile::createSeed(filename, filesize, md5,
                                                   description, seedIp, seedPort);
     if (!tracker.save(trackPath)) {
         return "<createtracker fail>\n";
     }
-
+ 
     return "<createtracker succ>\n";
 }
-
+ 
 /// updatetracker: loads <filename>.track from the shared folder, removes dead
 /// peers whose update interval has elapsed, adds or updates the calling peer's
 /// byte range and timestamp, and saves the tracker file back to disk.
@@ -438,25 +402,25 @@ std::string handleUpdateTracker(const std::vector<std::string>& args) {
     if (args.empty()) {
         return "<updatetracker fail>\n";
     }
-
+ 
     const std::string& filename = args[0];
-
+ 
     if (args.size() != 5) {
         return "<updatetracker " + filename + " fail>\n";
     }
-
+ 
     const std::string& startBytesStr = args[1];
     const std::string& endBytesStr = args[2];
     const std::string& peerIp = args[3];
     const std::string& portStr = args[4];
-
+ 
     // Reject empty or path-traversing filenames
     if (filename.empty() || filename == "." || filename == ".." ||
         filename.find('/') != std::string::npos ||
         filename.find('\\') != std::string::npos) {
         return "<updatetracker " + filename + " fail>\n";
     }
-
+ 
     // Parse start_bytes and end_bytes (non-negative decimal integers, start <= end)
     errno = 0;
     char* end = nullptr;
@@ -464,7 +428,7 @@ std::string handleUpdateTracker(const std::vector<std::string>& args) {
     if (startBytesStr.empty() || errno != 0 || *end != '\0' || startByte < 0) {
         return "<updatetracker " + filename + " fail>\n";
     }
-
+ 
     errno = 0;
     end = nullptr;
     long long endByte = std::strtoll(endBytesStr.c_str(), &end, 10);
@@ -472,7 +436,7 @@ std::string handleUpdateTracker(const std::vector<std::string>& args) {
         endByte < startByte) {
         return "<updatetracker " + filename + " fail>\n";
     }
-
+ 
     // Parse port (1..65535)
     errno = 0;
     end = nullptr;
@@ -482,45 +446,45 @@ std::string handleUpdateTracker(const std::vector<std::string>& args) {
         return "<updatetracker " + filename + " fail>\n";
     }
     int peerPort = static_cast<int>(portValue);
-
+ 
     if (peerIp.empty() || sharedFolder.empty()) {
         return "<updatetracker " + filename + " fail>\n";
     }
-
+ 
     // Validate IPv4 address format (also rejects colons that would break peer lines)
     in_addr parsedIp{};
     if (inet_pton(AF_INET, peerIp.c_str(), &parsedIp) != 1) {
         return "<updatetracker " + filename + " fail>\n";
     }
-
+ 
     std::string trackPath = sharedFolder + "/" + filename + ".track";
-
+ 
     std::lock_guard<std::mutex> lock(trackerFilesMutex);
-
+ 
     struct stat st{};
     if (stat(trackPath.c_str(), &st) != 0) {
         return "<updatetracker " + filename + " ferr>\n";
     }
-
+ 
     TrackerFile tracker;
     if (!tracker.load(trackPath)) {
         return "<updatetracker " + filename + " fail>\n";
     }
-
+ 
     if (endByte > tracker.filesize) {
         return "<updatetracker " + filename + " fail>\n";
     }
-
+ 
     tracker.pruneDead(updateIntervalSeconds);
     tracker.upsertPeer(peerIp, peerPort, startByte, endByte);
-
+ 
     if (!tracker.save(trackPath)) {
         return "<updatetracker " + filename + " fail>\n";
     }
-
+ 
     return "<updatetracker " + filename + " succ>\n";
 }
-
+ 
 // The words after the command word(s), passed to the handler as its
 // arguments (empty for now, since every handler is a stub).
 std::vector<std::string> argsAfter(const std::vector<std::string>& words, std::size_t skip) {
@@ -530,13 +494,13 @@ std::vector<std::string> argsAfter(const std::vector<std::string>& words, std::s
     }
     return args;
 }
-
+ 
 // Turns one request line into a reply by routing it to its handler.
 // Commands are accepted with or without the < > wrapper and with or
 // without the trailing newline, e.g. "<REQ LIST>\n" and "REQ LIST".
-std::string dispatch(const std::string& request, const std::string& peer) {
+std::string dispatch(const std::string& request) {
     std::string line = request;
-
+ 
     // drop the < > wrapper if it is there
     if (!line.empty() && line.front() == '<') {
         line.erase(0, 1);
@@ -552,7 +516,7 @@ std::string dispatch(const std::string& request, const std::string& peer) {
             line.pop_back();
         }
     }
-
+ 
     // split into words; the first word (or two) names the command
     std::vector<std::string> words;
     std::istringstream stream(line);
@@ -563,9 +527,9 @@ std::string dispatch(const std::string& request, const std::string& peer) {
     if (words.empty()) {
         return unknownCommandReply;
     }
-
+ 
     if (words[0] == "REQ" && words.size() > 1 && words[1] == "LIST") {
-        return handleList(argsAfter(words, 2), peer);
+        return handleList(argsAfter(words, 2));
     }
     if (words[0] == "GET") {
         return handleGet(argsAfter(words, 1));
@@ -578,7 +542,7 @@ std::string dispatch(const std::string& request, const std::string& peer) {
     }
     return unknownCommandReply;
 }
-
+ 
 // Serves exactly one peer: read one request line, send the reply,
 // close. Runs in its own thread, so nothing here may take the server
 // down: every failure becomes a log line at most.
@@ -589,38 +553,39 @@ void serveConnection(int clientSocket, const std::string& peerAddress) {
         close(clientSocket);
         return;
     }
-
-    std::string reply = dispatch(request, peerAddress);
-
+ 
+    std::string reply = dispatch(request);
+ 
     if (!sendAll(clientSocket, reply)) {
         std::cerr << "Tracker: " << peerAddress << " left before the reply arrived\n";
     }
     close(clientSocket);
 }
-
+ 
 }  // namespace
-
+ 
 int main() {
     int port = 0;
     std::string folder;
     if (!readConfig(port, folder)) {
         return 1;
     }
-
+ 
     sharedFolder = folder;
     prepareSharedFolder(folder);
-
+    sharedFolder = folder;  // the handlers read tracker files from here
+ 
     // A worker whose peer disappears mid-reply would otherwise take a
     // SIGPIPE and kill the whole server with it
     std::signal(SIGPIPE, SIG_IGN);
-
+ 
     int listenSocket = createListenSocket(port);
     if (listenSocket < 0) {
         return 1;
     }
     std::cout << "Tracker: listening on port " << port
               << " (shared folder: " << folder << ")\n";
-
+ 
     // The accept loop only accepts and hands off; all request handling
     // happens inside the worker threads it spawns
     while (true) {
@@ -636,14 +601,14 @@ int main() {
             std::cerr << "Tracker: accept failed: " << std::strerror(errno) << "\n";
             continue;  // one bad accept must not stop the server
         }
-
+ 
         char peerIp[INET_ADDRSTRLEN];
         const char* printed = inet_ntop(AF_INET, &peerAddress.sin_addr, peerIp, sizeof(peerIp));
         std::string peer = printed != nullptr
                                ? std::string(peerIp) + ":" + std::to_string(ntohs(peerAddress.sin_port))
                                : "unknown address";
         std::cout << "Tracker: connection from " << peer << "\n";
-
+ 
         // hand the connection to its worker right away
         try {
             std::thread worker(serveConnection, clientSocket, peer);
