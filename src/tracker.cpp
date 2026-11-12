@@ -19,6 +19,7 @@
 #include <cctype>
 #include <cerrno>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <mutex>
@@ -28,6 +29,7 @@
 #include <vector>
 
 #include "common.h"
+#include "tracker_file.h"
 
 namespace {
 
@@ -41,6 +43,15 @@ const std::size_t maxRequestBytes = 4096;
 // The reply for commands the tracker does not know. The doc does not
 // define one, so this is our choice.
 const char unknownCommandReply[] = "ERROR: unknown command\n";
+
+// Default peer update interval in seconds (15 minutes, matching peer config)
+const long long defaultUpdateIntervalSeconds = 900;
+
+// Shared folder where .track files are stored (loaded from sconfig at startup)
+std::string sharedFolder;
+
+// Maximum age (in seconds) before a peer entry is considered dead
+long long updateIntervalSeconds = defaultUpdateIntervalSeconds;
 
 // One mutex around every tracker-file read/modify/write. The handlers
 // (once implemented) hold this around their load -> modify -> save
@@ -72,6 +83,29 @@ bool readConfig(int& port, std::string& folder) {
         return false;
     }
     folder = config[1];
+
+    // Optional 3rd line in sconfig for update interval; otherwise fall back
+    // to peer1/clientThreadConfig.cfg (line 3) or defaultUpdateIntervalSeconds
+    if (config.size() >= 3) {
+        errno = 0;
+        end = nullptr;
+        long long intervalValue = std::strtoll(config[2].c_str(), &end, 10);
+        if (config[2].empty() || errno != 0 || *end != '\0' || intervalValue < 1) {
+            std::cerr << "Tracker: bad update interval '" << config[2] << "' in sconfig\n";
+            return false;
+        }
+        updateIntervalSeconds = intervalValue;
+    } else {
+        std::vector<std::string> clientCfg = readConfigLines("peer1/clientThreadConfig.cfg");
+        if (clientCfg.size() >= 3) {
+            errno = 0;
+            end = nullptr;
+            long long intervalValue = std::strtoll(clientCfg.back().c_str(), &end, 10);
+            if (!clientCfg.back().empty() && errno == 0 && *end == '\0' && intervalValue >= 1) {
+                updateIntervalSeconds = intervalValue;
+            }
+        }
+    }
     return true;
 }
 
@@ -205,10 +239,95 @@ std::string handleCreateTracker(const std::vector<std::string>& /*args*/) {
     return "createtracker handler not implemented yet\n";
 }
 
-/// updatetracker: will load, pruneDead, upsertPeer and save, with
-/// trackerFilesMutex held around the whole sequence.
-std::string handleUpdateTracker(const std::vector<std::string>& /*args*/) {
-    return "updatetracker handler not implemented yet\n";
+/// updatetracker: loads <filename>.track from the shared folder, removes dead
+/// peers whose update interval has elapsed, adds or updates the calling peer's
+/// byte range and timestamp, and saves the tracker file back to disk.
+/// Wire format: <updatetracker filename start_bytes end_bytes ip-address port-number>\n
+std::string handleUpdateTracker(const std::vector<std::string>& args) {
+    if (args.empty()) {
+        return "<updatetracker fail>\n";
+    }
+
+    const std::string& filename = args[0];
+
+    if (args.size() != 5) {
+        return "<updatetracker " + filename + " fail>\n";
+    }
+
+    const std::string& startBytesStr = args[1];
+    const std::string& endBytesStr = args[2];
+    const std::string& peerIp = args[3];
+    const std::string& portStr = args[4];
+
+    // Reject empty or path-traversing filenames
+    if (filename.empty() || filename == "." || filename == ".." ||
+        filename.find('/') != std::string::npos ||
+        filename.find('\\') != std::string::npos) {
+        return "<updatetracker " + filename + " fail>\n";
+    }
+
+    // Parse start_bytes and end_bytes (non-negative decimal integers, start <= end)
+    errno = 0;
+    char* end = nullptr;
+    long long startByte = std::strtoll(startBytesStr.c_str(), &end, 10);
+    if (startBytesStr.empty() || errno != 0 || *end != '\0' || startByte < 0) {
+        return "<updatetracker " + filename + " fail>\n";
+    }
+
+    errno = 0;
+    end = nullptr;
+    long long endByte = std::strtoll(endBytesStr.c_str(), &end, 10);
+    if (endBytesStr.empty() || errno != 0 || *end != '\0' || endByte < 0 ||
+        endByte < startByte) {
+        return "<updatetracker " + filename + " fail>\n";
+    }
+
+    // Parse port (1..65535)
+    errno = 0;
+    end = nullptr;
+    long portValue = std::strtol(portStr.c_str(), &end, 10);
+    if (portStr.empty() || errno != 0 || *end != '\0' ||
+        portValue < 1 || portValue > 65535) {
+        return "<updatetracker " + filename + " fail>\n";
+    }
+    int peerPort = static_cast<int>(portValue);
+
+    if (peerIp.empty() || sharedFolder.empty()) {
+        return "<updatetracker " + filename + " fail>\n";
+    }
+
+    // Validate IPv4 address format (also rejects colons that would break peer lines)
+    in_addr parsedIp{};
+    if (inet_pton(AF_INET, peerIp.c_str(), &parsedIp) != 1) {
+        return "<updatetracker " + filename + " fail>\n";
+    }
+
+    std::string trackPath = sharedFolder + "/" + filename + ".track";
+
+    std::lock_guard<std::mutex> lock(trackerFilesMutex);
+
+    struct stat st{};
+    if (stat(trackPath.c_str(), &st) != 0) {
+        return "<updatetracker " + filename + " ferr>\n";
+    }
+
+    TrackerFile tracker;
+    if (!tracker.load(trackPath)) {
+        return "<updatetracker " + filename + " fail>\n";
+    }
+
+    if (endByte > tracker.filesize) {
+        return "<updatetracker " + filename + " fail>\n";
+    }
+
+    tracker.pruneDead(updateIntervalSeconds);
+    tracker.upsertPeer(peerIp, peerPort, startByte, endByte);
+
+    if (!tracker.save(trackPath)) {
+        return "<updatetracker " + filename + " fail>\n";
+    }
+
+    return "<updatetracker " + filename + " succ>\n";
 }
 
 // The words after the command word(s), passed to the handler as its
@@ -297,6 +416,7 @@ int main() {
         return 1;
     }
 
+    sharedFolder = folder;
     prepareSharedFolder(folder);
 
     // A worker whose peer disappears mid-reply would otherwise take a
