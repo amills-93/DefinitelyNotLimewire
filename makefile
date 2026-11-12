@@ -22,13 +22,14 @@ PEERS = peer1 peer2 peer3
 all: tracker peers
 
 # Build the tracker executable in the main folder.
-# Also make sure its shared folder (torrents) exists.
+# (The tracker creates its shared folder, named in sconfig, at startup.)
 tracker: $(TRACKER_SRC) $(HEADERS)
 	mkdir -p torrents
 	$(CXX) $(CXXFLAGS) $(TRACKER_SRC) -o tracker $(LDLIBS)
 
 # Build the peer once, copy it into peer1/, peer2/, peer3/,
-# make each peer's shared folder, then delete the extra copy.
+# then delete the extra copy. (Each peer creates its shared folder,
+# named in its serverThreadConfig.cfg, at startup.)
 peers: $(PEER_SRC) $(HEADERS)
 	$(CXX) $(CXXFLAGS) $(PEER_SRC) -o peer $(LDLIBS)
 	for p in $(PEERS); do mkdir -p $$p/shared; cp peer $$p/peer; done
