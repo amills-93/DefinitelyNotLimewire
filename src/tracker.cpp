@@ -62,10 +62,6 @@ long long updateIntervalSeconds = defaultUpdateIntervalSeconds;
 // sequence, because TrackerFile itself is not thread-safe.
 std::mutex trackerFilesMutex;
 
-// The shared folder from sconfig (e.g. "torrents"). Set once in main()
-// before any worker thread starts, then only read by the handlers.
-std::string sharedFolder;
-
 // sconfig: line 1 = port number, line 2 = shared folder (torrents).
 // Returns false (with a clear error printed) if the file is missing,
 // too short, or has a bad port.
@@ -91,7 +87,7 @@ bool readConfig(int& port, std::string& folder) {
     // to peer1/clientThreadConfig.cfg (line 3) or defaultUpdateIntervalSeconds
     if (config.size() >= 3) {
         errno = 0;
-        end = nullptr;
+        char* end = nullptr;
         long long intervalValue = std::strtoll(config[2].c_str(), &end, 10);
         if (config[2].empty() || errno != 0 || *end != '\0' || intervalValue < 1) {
             std::cerr << "Tracker: bad update interval '" << config[2] << "' in sconfig\n";
@@ -102,7 +98,7 @@ bool readConfig(int& port, std::string& folder) {
         std::vector<std::string> clientCfg = readConfigLines("peer1/clientThreadConfig.cfg");
         if (clientCfg.size() >= 3) {
             errno = 0;
-            end = nullptr;
+            char* end = nullptr;
             long long intervalValue = std::strtoll(clientCfg.back().c_str(), &end, 10);
             if (!clientCfg.back().empty() && errno == 0 && *end == '\0' && intervalValue >= 1) {
                 updateIntervalSeconds = intervalValue;
@@ -225,12 +221,84 @@ bool sendAll(int clientSocket, const std::string& text) {
     return true;
 }
 
-// ---- request handlers (stubs: the real logic lands here later) ----
+// ---- request handlers ----
 
-/// REQ LIST: will load every tracker in the shared folder and reply
-/// with each file's name, size and MD5.
-std::string handleList(const std::vector<std::string>& /*args*/) {
-    return "LIST handler not implemented yet\n";
+// One LIST row: the header fields shown for a tracker file. The .track
+// path is kept only to order files that share the same Filename.
+struct ListEntry {
+    std::string name;
+    long long size = 0;
+    std::string md5;
+    std::string path;
+};
+
+/// REQ LIST: scans the shared folder and replies with one line per
+/// tracker file, e.g.
+///   <REP LIST 2>
+///   <1 movie1.avi 104857600 d41d8cd98f00b204e9800998ecf8427e>
+///   <2 movie2.mkv 209715200 0cc175b9c0f1b6a831c399e269772661>
+///   <REP LIST END>
+/// The original Filename header is printed (not the .track name), which
+/// is what the doc's example shows and what GET accepts (it adds .track
+/// itself). The doc leaves the order open, so entries are sorted by name.
+std::string handleList(const std::vector<std::string>& /*args*/, const std::string& peer) {
+    std::cout << "Tracker: LIST requested from " << peer << "\n";
+
+    std::vector<ListEntry> entries;
+    {
+        // Hold the tracker-file mutex for the whole scan, so a writer can
+        // never change a file between our open and read.
+        std::lock_guard<std::mutex> lock(trackerFilesMutex);
+
+        DIR* dir = opendir(sharedFolder.c_str());
+        if (dir == nullptr) {
+            // The doc defines no reply for this, so this is our choice
+            std::cerr << "Tracker: could not read shared folder '" << sharedFolder
+                      << "': " << std::strerror(errno) << "\n";
+            return "ERROR: could not read shared folder\n";
+        }
+
+        struct dirent* item;
+        while ((item = readdir(dir)) != nullptr) {
+            std::string fileName = item->d_name;
+            // only files ending in .track (and not the bare name ".track")
+            if (fileName.size() <= 6 ||
+                fileName.compare(fileName.size() - 6, 6, ".track") != 0) {
+                continue;
+            }
+
+            std::string path = sharedFolder + "/" + fileName;
+            // load() skips # comments and checks the header fields, so a
+            // malformed file is simply left out of the reply
+            TrackerFile tracker;
+            if (!tracker.load(path)) {
+                std::cerr << "Tracker: malformed tracker file '" << path
+                          << "' (skipped)\n";
+                continue;
+            }
+            entries.push_back(ListEntry{tracker.filename, tracker.filesize,
+                                        tracker.md5, path});
+        }
+        closedir(dir);
+    }
+
+    std::sort(entries.begin(), entries.end(),
+              [](const ListEntry& a, const ListEntry& b) {
+                  if (a.name != b.name) {
+                      return a.name < b.name;
+                  }
+                  return a.path < b.path;
+              });
+
+    // An empty folder gives "<REP LIST 0>" directly followed by the END line
+    std::ostringstream reply;
+    reply << "<REP LIST " << entries.size() << ">\n";
+    for (std::size_t i = 0; i < entries.size(); i++) {
+        reply << "<" << (i + 1) << " " << entries[i].name << " "
+              << entries[i].size << " " << entries[i].md5 << ">\n";
+    }
+    reply << "<REP LIST END>\n";
+    return reply.str();
 }
 
 /// GET <filename>.track: replies with the tracker file's contents:
@@ -466,7 +534,7 @@ std::vector<std::string> argsAfter(const std::vector<std::string>& words, std::s
 // Turns one request line into a reply by routing it to its handler.
 // Commands are accepted with or without the < > wrapper and with or
 // without the trailing newline, e.g. "<REQ LIST>\n" and "REQ LIST".
-std::string dispatch(const std::string& request) {
+std::string dispatch(const std::string& request, const std::string& peer) {
     std::string line = request;
 
     // drop the < > wrapper if it is there
@@ -497,7 +565,7 @@ std::string dispatch(const std::string& request) {
     }
 
     if (words[0] == "REQ" && words.size() > 1 && words[1] == "LIST") {
-        return handleList(argsAfter(words, 2));
+        return handleList(argsAfter(words, 2), peer);
     }
     if (words[0] == "GET") {
         return handleGet(argsAfter(words, 1));
@@ -522,7 +590,7 @@ void serveConnection(int clientSocket, const std::string& peerAddress) {
         return;
     }
 
-    std::string reply = dispatch(request);
+    std::string reply = dispatch(request, peerAddress);
 
     if (!sendAll(clientSocket, reply)) {
         std::cerr << "Tracker: " << peerAddress << " left before the reply arrived\n";
@@ -541,7 +609,6 @@ int main() {
 
     sharedFolder = folder;
     prepareSharedFolder(folder);
-    sharedFolder = folder;  // the handlers read tracker files from here
 
     // A worker whose peer disappears mid-reply would otherwise take a
     // SIGPIPE and kill the whole server with it
