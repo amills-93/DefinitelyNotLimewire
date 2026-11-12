@@ -16,6 +16,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <csignal>
@@ -289,10 +290,76 @@ std::string handleGet(const std::vector<std::string>& args) {
            "<REP GET END " + md5OfString(content) + ">\n";
 }
 
-/// createtracker: will build a fresh tracker with TrackerFile::createSeed()
-/// and save it as <filename>.track in the shared folder.
-std::string handleCreateTracker(const std::vector<std::string>& /*args*/) {
-    return "createtracker handler not implemented yet\n";
+/// createtracker: builds a fresh tracker with TrackerFile::createSeed()
+/// and saves it as <filename>.track in the shared folder.
+/// Wire format: <createtracker filename filesize description md5 ip-address port-number>\n
+/// Description uses '_' for spaces on the wire.
+std::string handleCreateTracker(const std::vector<std::string>& args) {
+    if (args.size() != 6) {
+        return "<createtracker fail>\n";
+    }
+
+    const std::string& filename = args[0];
+    const std::string& filesizeStr = args[1];
+    std::string description = args[2];
+    const std::string& md5 = args[3];
+    const std::string& seedIp = args[4];
+    const std::string& portStr = args[5];
+
+    // Reject empty or path-traversing filenames
+    if (filename.empty() || filename == "." || filename == ".." ||
+        filename.find('/') != std::string::npos ||
+        filename.find('\\') != std::string::npos) {
+        return "<createtracker fail>\n";
+    }
+
+    // Parse filesize (non-negative decimal integer)
+    errno = 0;
+    char* end = nullptr;
+    long long filesize = std::strtoll(filesizeStr.c_str(), &end, 10);
+    if (filesizeStr.empty() || errno != 0 || *end != '\0' || filesize < 0) {
+        return "<createtracker fail>\n";
+    }
+
+    // Parse port (1..65535)
+    errno = 0;
+    end = nullptr;
+    long portValue = std::strtol(portStr.c_str(), &end, 10);
+    if (portStr.empty() || errno != 0 || *end != '\0' ||
+        portValue < 1 || portValue > 65535) {
+        return "<createtracker fail>\n";
+    }
+    int seedPort = static_cast<int>(portValue);
+
+    if (md5.empty() || seedIp.empty() || sharedFolder.empty()) {
+        return "<createtracker fail>\n";
+    }
+
+    // Validate IPv4 address format (also rejects colons that would break peer lines)
+    in_addr parsedIp{};
+    if (inet_pton(AF_INET, seedIp.c_str(), &parsedIp) != 1) {
+        return "<createtracker fail>\n";
+    }
+
+    // Description uses '_' for spaces in the wire format
+    std::replace(description.begin(), description.end(), '_', ' ');
+
+    std::string trackPath = sharedFolder + "/" + filename + ".track";
+
+    std::lock_guard<std::mutex> lock(trackerFilesMutex);
+
+    struct stat st{};
+    if (stat(trackPath.c_str(), &st) == 0) {
+        return "<createtracker ferr>\n";
+    }
+
+    TrackerFile tracker = TrackerFile::createSeed(filename, filesize, md5,
+                                                  description, seedIp, seedPort);
+    if (!tracker.save(trackPath)) {
+        return "<createtracker fail>\n";
+    }
+
+    return "<createtracker succ>\n";
 }
 
 /// updatetracker: loads <filename>.track from the shared folder, removes dead
